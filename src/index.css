@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-surface-950 text-surface-200 antialiased;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  /* 自定义滚动条 */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background-color: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: rgba(103, 94, 120, 0.5);
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(125, 115, 145, 0.7);
+  }
+
+  /* 选中文本高亮 */
+  ::selection {
+    @apply text-surface-100;
+    background-color: rgba(154, 59, 255, 0.3);
+  }
+
+  /* 代码块样式覆盖 */
+  pre {
+    @apply !bg-surface-950;
+  }
+
+  pre code {
+    @apply !bg-transparent;
+  }
+}
+
+@layer components {
+  /* 毛玻璃面板 */
+  .glass-panel {
+    @apply backdrop-blur-xl bg-surface-900/60 border border-surface-700/30;
+  }
+
+  /* 用户消息气泡 */
+  .message-user {
+    @apply bg-gradient-to-br from-primary-600/20 to-primary-800/10 border border-primary-500/20;
+  }
+
+  /* AI 消息气泡 */
+  .message-assistant {
+    @apply bg-gradient-to-br from-surface-800/60 to-surface-900/40 border border-surface-700/20;
+  }
+
+  /* 输入框聚焦光晕 */
+  .input-glow:focus-within {
+    box-shadow: 0 0 0 1px rgba(154, 59, 255, 0.3), 0 0 20px -4px rgba(154, 59, 255, 0.15);
+  }
+}
