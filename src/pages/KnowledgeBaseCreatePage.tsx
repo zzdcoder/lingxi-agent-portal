@@ -1,4 +1,4 @@
-import {useState, useRef, useCallback} from 'react';
+import {useState, useRef, useCallback, useEffect} from 'react';
 import {motion, AnimatePresence} from 'framer-motion';
 // ... existing code ...
 import {
@@ -8,19 +8,26 @@ import {
   Check,
   ChevronDown,
   Sparkles,
-  Layers,
   Search,
-  Grid3x3,
   ExternalLink,
   ArrowRight,
   BookOpen,
   Trash2,
-  Settings,
   HelpCircle,
   RotateCcw,
   LayoutTemplate,
   Users,
+  SlidersHorizontal,
+  X,
+  Plus,
+  Type,
+  Hash,
+  Clock,
+  Tag,
 } from 'lucide-react';
+import {listMetadata, type MetadataDefinition} from '../services/metadata';
+import {uploadFile, type UploadedFile} from '../services/file';
+import {previewChunks, previewParentChildChunks, saveProcess, type ChunkPreview, type ParentChildChunk} from '../services/fileProcess';
 
 // ... existing code ...
 
@@ -28,7 +35,10 @@ interface FileItem {
   id: string;
   name: string;
   size: string;
-  status: 'pending' | 'done';
+  status: 'pending' | 'uploading' | 'done' | 'error';
+  file?: File;
+  uploadedInfo?: UploadedFile;
+  error?: string;
 }
 
 // 新增 Chunk 类型
@@ -37,6 +47,9 @@ interface ChunkItem {
   length: number;
   content: string;
 }
+
+// 文件预览状态
+type PreviewState = 'idle' | 'loading' | 'success' | 'error';
 
 type CreateStep = 1 | 2 | 3;
 
@@ -51,34 +64,7 @@ const STEPS: StepConfig[] = [
   {id: 3, label: '处理并完成'},
 ];
 
-// 新增 mock chunks
-const MOCK_CHUNKS: ChunkItem[] = [
-  {
-    id: 1,
-    length: 70,
-    content: '这些规则适用于本项目中的每一项任务，除非有明确的例外说明。**核心倾向**：在处理非琐碎工作时，谨慎优先于速度。对于琐碎的任务则灵活判断。',
-  },
-  {
-    id: 2,
-    length: 106,
-    content: '准则 1 —— 先思考，再动手写代码** 明确说出你的假设。如果不确定，直接提问而不是瞎猜。 当存在歧义时，列出多种可能的解读。 如果有更简单的解决方案，要主动提出来。 感到困惑时就停下来，并明确指出哪里不清楚。',
-  },
-  {
-    id: 3,
-    length: 101,
-    content: '准则 2 —— 简单至上** 用最少的代码解决当前的问题。绝不写任何推测性的代码。 不做需求以外的功能。不为只用一次的代码搞抽象封装。 自我检验：资深工程师看了会不会觉得这太复杂了？如果是，那就简化它。',
-  },
-  {
-    id: 4,
-    length: 86,
-    content: '准则 3 —— 外科手术式的改动** 只动必须动的地方。只收拾你自己弄出的烂摊子。 不要去“优化”旁边的代码、注释或格式。 没坏的东西就别去重构。保持和现有的代码风格一致。',
-  },
-  {
-    id: 5,
-    length: 88,
-    content: '准则 4 —— 目标驱动执行** 定义好成功的标准，然后循环迭代直到验证通过。 不要死板地按步骤走。定义好成功状态，然后不断逼近它。 有了清晰的成功标准，你就能独立地持续迭代。',
-  },
-];
+
 
 export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
   onBack: () => void;
@@ -101,6 +87,26 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
     useQa: false,
   });
   const [indexMode] = useState<'high' | 'eco'>('high');
+  
+  // 预览状态
+  const [previewState, setPreviewState] = useState<PreviewState>('idle');
+  const [previewChunkList, setPreviewChunkList] = useState<ChunkPreview[]>([]);
+  const [previewParentChildList, setPreviewParentChildList] = useState<ParentChildChunk[]>([]);
+  const [previewError, setPreviewError] = useState<string>('');
+  const [selectedPreviewFileId, setSelectedPreviewFileId] = useState<string>('');
+
+  // 保存处理状态
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string>('');
+
+  // Document settings states
+  const [docPermission, setDocPermission] = useState<'public' | 'private'>('public');
+  const [selectedMetadata, setSelectedMetadata] = useState<Array<{id: string; name: string; field_type: string; value: string}>>([]);
+  const [showMetadataModal, setShowMetadataModal] = useState(false);
+  const [metadataList, setMetadataList] = useState<MetadataDefinition[]>([]);
+  const [metaLoading, setMetaLoading] = useState(false);
+  const [tempSelectedIds, setTempSelectedIds] = useState<Set<string>>(new Set());
+  const [selectedFields, setSelectedFields] = useState<string[]>([]);
 
   // Step 3 states
   const [kbName, setKbName] = useState('');
@@ -116,7 +122,9 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
     autoSummary: false,
   });
 
-  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  const [uploadingCount, setUploadingCount] = useState(0);
+
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files;
     if (!selected) return;
     const newFiles: FileItem[] = Array.from(selected).map((f, i) => ({
@@ -124,14 +132,22 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
       name: f.name,
       size: `${(f.size / 1024).toFixed(1)} KB`,
       status: 'pending',
+      file: f,
     }));
     setFiles((prev) => [...prev, ...newFiles].slice(0, 5));
     if (!kbName && newFiles[0]) {
       setKbName(newFiles[0].name.replace(/\.[^/.]+$/, ''));
     }
+
+    // 自动上传文件
+    for (const item of newFiles) {
+      if (item.file) {
+        await uploadSingleFile(item.id, item.file);
+      }
+    }
   }, [kbName]);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
     const dropped = e.dataTransfer.files;
@@ -140,18 +156,233 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
       name: f.name,
       size: `${(f.size / 1024).toFixed(1)} KB`,
       status: 'pending',
+      file: f,
     }));
     setFiles((prev) => [...prev, ...newFiles].slice(0, 5));
     if (!kbName && newFiles[0]) {
       setKbName(newFiles[0].name.replace(/\.[^/.]+$/, ''));
     }
+
+    // 自动上传文件
+    for (const item of newFiles) {
+      if (item.file) {
+        await uploadSingleFile(item.id, item.file);
+      }
+    }
   }, [kbName]);
+
+  // 上传单个文件到 COS
+  const uploadSingleFile = useCallback(async (id: string, file: File) => {
+    setFiles((prev) => prev.map((f) => f.id === id ? {...f, status: 'uploading'} : f));
+    setUploadingCount((c) => c + 1);
+    try {
+      const uploadedInfo = await uploadFile(file);
+      setFiles((prev) => prev.map((f) => f.id === id ? {...f, status: 'done', uploadedInfo} : f));
+    } catch (err) {
+      setFiles((prev) => prev.map((f) => f.id === id ? {...f, status: 'error', error: (err as Error).message} : f));
+    } finally {
+      setUploadingCount((c) => c - 1);
+    }
+  }, []);
 
   const removeFile = (id: string) => {
     setFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
   const canProceed = files.length > 0;
+
+  const loadMetadata = useCallback(async () => {
+    setMetaLoading(true);
+    try {
+      const data = await listMetadata();
+      setMetadataList(data);
+    } catch {
+      // ignore
+    } finally {
+      setMetaLoading(false);
+    }
+  }, []);
+
+  const openMetadataModal = useCallback(() => {
+    setTempSelectedIds(new Set(selectedMetadata.map((m) => m.id)));
+    setShowMetadataModal(true);
+    loadMetadata();
+  }, [selectedMetadata, loadMetadata]);
+
+  const closeMetadataModal = useCallback(() => {
+    setShowMetadataModal(false);
+  }, []);
+
+  const confirmMetadataSelection = useCallback(() => {
+    const newSelected = metadataList
+      .filter((m) => tempSelectedIds.has(m.id))
+      .map((m) => ({
+        id: m.id,
+        name: m.name,
+        field_type: m.field_type,
+        value: selectedMetadata.find((s) => s.id === m.id)?.value || '',
+      }));
+    setSelectedMetadata(newSelected);
+    setShowMetadataModal(false);
+  }, [metadataList, tempSelectedIds, selectedMetadata]);
+
+  const removeSelectedMetadata = useCallback((id: string) => {
+    setSelectedMetadata((prev) => prev.filter((m) => m.id !== id));
+  }, []);
+
+  const updateMetadataValue = useCallback((id: string, value: string) => {
+    setSelectedMetadata((prev) =>
+      prev.map((m) => (m.id === id ? {...m, value} : m))
+    );
+  }, []);
+
+  const toggleTempMetadata = useCallback((id: string) => {
+    setTempSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleField = useCallback((field: string) => {
+    setSelectedFields((prev) =>
+      prev.includes(field) ? prev.filter((f) => f !== field) : [...prev, field]
+    );
+  }, []);
+
+  const removeField = useCallback((field: string) => {
+    setSelectedFields((prev) => prev.filter((f) => f !== field));
+  }, []);
+
+  // 获取已上传成功的文件
+  const getUploadedFiles = useCallback((): UploadedFile[] => {
+    return files
+      .filter((f) => f.status === 'done' && f.uploadedInfo)
+      .map((f) => f.uploadedInfo!);
+  }, [files]);
+
+  // 获取当前选中的预览文件
+  const getSelectedPreviewFile = useCallback((): FileItem | undefined => {
+    if (selectedPreviewFileId) {
+      return files.find((f) => f.id === selectedPreviewFileId);
+    }
+    // 默认返回第一个已上传成功的文件
+    return files.find((f) => f.status === 'done' && f.uploadedInfo);
+  }, [files, selectedPreviewFileId]);
+
+  // 处理预览块
+  const handlePreviewChunks = useCallback(async () => {
+    const fileToPreview = getSelectedPreviewFile();
+    if (!fileToPreview || !fileToPreview.uploadedInfo) {
+      setPreviewError('请先上传文件');
+      setPreviewState('error');
+      return;
+    }
+
+    setPreviewState('loading');
+    setPreviewError('');
+
+    try {
+      const fileExt = fileToPreview.name.split('.').pop()?.toLowerCase() || '';
+      const metadataListPayload = selectedMetadata
+        .filter((m) => m.value.trim() !== '')
+        .map((m) => ({ [m.name]: m.value }));
+
+      // 通用分段模式
+      if (segmentMode === 'general') {
+        const chunks = await previewChunks({
+          file_id: fileToPreview.uploadedInfo.id,
+          file_type: fileExt,
+          separators: delimiter,
+          chunk_size: maxLength,
+          chunk_overlap: overlapLength,
+          ddl_option1: preprocessRules.removeSpaces,
+          ddl_option2: preprocessRules.removeUrls,
+          metadata_list: metadataListPayload,
+          auth_option: docPermission,
+          belong_demain: selectedFields,
+        });
+        setPreviewChunkList(chunks);
+        setPreviewParentChildList([]);
+      } else {
+        // 父子分段模式
+        const parentChildResult = await previewParentChildChunks(
+          {
+            file_id: fileToPreview.uploadedInfo.id,
+            file_type: fileExt,
+            separators: delimiter,
+            chunk_size: maxLength,
+            chunk_overlap: overlapLength,
+            ddl_option1: preprocessRules.removeSpaces,
+            ddl_option2: preprocessRules.removeUrls,
+            metadata_list: metadataListPayload,
+            auth_option: docPermission,
+            belong_demain: selectedFields,
+          },
+          {
+            mode: parentChildConfig.parentMode,
+            delimiter: parentChildConfig.parentDelimiter,
+            max_length: parentChildConfig.parentMaxLength,
+          },
+          {
+            delimiter: parentChildConfig.childDelimiter,
+            max_length: parentChildConfig.childMaxLength,
+          }
+        );
+        setPreviewParentChildList(parentChildResult);
+        setPreviewChunkList([]);
+      }
+
+      setPreviewState('success');
+    } catch (err) {
+      setPreviewError((err as Error).message || '预览失败');
+      setPreviewState('error');
+    }
+  }, [getSelectedPreviewFile, segmentMode, delimiter, maxLength, overlapLength, parentChildConfig, preprocessRules, docPermission, selectedFields, selectedMetadata]);
+
+  const FIELD_OPTIONS = ['技术类', '人事类', '运维类', '客户类'];
+
+  // 保存并处理
+  const handleSaveAndProcess = useCallback(async () => {
+    const fileToProcess = getSelectedPreviewFile();
+    if (!fileToProcess || !fileToProcess.uploadedInfo) {
+      setSaveError('请先上传文件');
+      return;
+    }
+
+    setSaving(true);
+    setSaveError('');
+
+    try {
+      const fileExt = fileToProcess.name.split('.').pop()?.toLowerCase() || '';
+      const metadataListPayload = selectedMetadata
+        .filter((m) => m.value.trim() !== '')
+        .map((m) => ({ [m.name]: m.value }));
+
+      await saveProcess({
+        file_id: fileToProcess.uploadedInfo.id,
+        file_type: fileExt,
+        segment_mode: segmentMode,
+        separators: segmentMode === 'general' ? delimiter : parentChildConfig.parentDelimiter,
+        chunk_size: segmentMode === 'general' ? maxLength : parentChildConfig.parentMaxLength,
+        chunk_overlap: overlapLength,
+        ddl_option1: preprocessRules.removeSpaces,
+        ddl_option2: preprocessRules.removeUrls,
+        metadata_list: metadataListPayload,
+        auth_option: docPermission,
+        belong_demain: selectedFields,
+      });
+
+      // 成功后进入 step3
+      setFiles((prev) => prev.map((f) => ({...f, status: 'done'})));
+      setStep(3);
+    } catch (err) {
+      setSaveError((err as Error).message || '保存处理失败');
+    } finally {
+      setSaving(false);
+    }
+  }, [getSelectedPreviewFile, segmentMode, delimiter, maxLength, overlapLength, parentChildConfig, preprocessRules, docPermission, selectedFields, selectedMetadata]);
 
   function CustomCheckbox({checked, onChange, label, children}: {
     checked: boolean;
@@ -358,11 +589,14 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                     className="flex-1 flex min-h-0"
                 >
                   {/* Left Panel - 分段设置 */}
-                  <div className="flex-1 flex flex-col min-w-0 border-r border-surface-700/20">
-                    <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4"
-                         style={{scrollbarWidth: 'none', msOverflowStyle: 'none'}}>
+                  <div className="flex-[3] flex flex-col min-w-0 border-r border-surface-700/20">
+                    <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5"
+                         style={{scrollbarWidth: 'thin', msOverflowStyle: 'auto'}}>
                       {/* 标题 */}
-                      <h2 className="text-sm font-semibold text-surface-200">分段设置</h2>
+                      <div className="flex items-center gap-2">
+                        <div className="w-1 h-4 rounded-full bg-primary-500/60"/>
+                        <h2 className="text-sm font-semibold text-surface-200 tracking-wide">分段设置</h2>
+                      </div>
 
                       {/* 通用 Card */}
                       <div
@@ -395,76 +629,73 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                             <motion.div
                                 initial={{opacity: 0, height: 0}}
                                 animate={{opacity: 1, height: 'auto'}}
-                                className="px-4 pb-4 space-y-4"
+                                className="px-4 pb-4 space-y-5"
                             >
                               {/* 三个输入框 */}
-                              <div className="grid grid-cols-3 gap-3">
+                              <div className="grid grid-cols-3 gap-4">
                                 <div>
-                                  <label
-                                      className="flex items-center gap-1 text-xs text-surface-500 mb-1.5">
+                                  <label className="flex items-center gap-1 text-xs text-surface-400 mb-2 font-medium">
                                     分段标识符
-                                    <HelpCircle size={12} className="text-surface-600"/>
+                                    <HelpCircle size={11} className="text-surface-600"/>
                                   </label>
                                   <input
                                       type="text"
                                       value={delimiter}
                                       onChange={(e) => setDelimiter(e.target.value)}
-                                      className="w-full px-3 py-2 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
+                                      className="w-full px-3 py-2 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
                                   />
                                 </div>
                                 <div>
-                                  <label
-                                      className="block text-xs text-surface-500 mb-1.5">分段最大长度</label>
+                                  <label className="block text-xs text-surface-400 mb-2 font-medium">分段最大长度</label>
                                   <div className="relative">
                                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1.5 py-0.5 rounded">characters</span>
                                     <input
                                         type="number"
                                         value={maxLength}
-                                        onChange={(e) => setOverlapLength(Number(e.target.value))}
-                                        className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
+                                        onChange={(e) => setMaxLength(Number(e.target.value))}
+                                        className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
                                     />
                                   </div>
                                 </div>
                                 <div>
-                                  <label
-                                      className="flex items-center gap-1 text-xs text-surface-500 mb-1.5">
+                                  <label className="flex items-center gap-1 text-xs text-surface-400 mb-2 font-medium">
                                     分段重叠长度
-                                    <HelpCircle size={12} className="text-surface-600"/>
+                                    <HelpCircle size={11} className="text-surface-600"/>
                                   </label>
                                   <div className="relative">
-                                    <span
-                                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1.5 py-0.5 rounded">characters</span>
+                                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1.5 py-0.5 rounded">characters</span>
                                     <input
                                         type="number"
                                         value={overlapLength}
                                         onChange={(e) => setOverlapLength(Number(e.target.value))}
-                                        className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
+                                        className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
                                     />
                                   </div>
                                 </div>
                               </div>
 
                               {/* 文本预处理规则 */}
-                              <div className="space-y-2.5 pt-1">
+                              <div className="rounded-lg bg-surface-950/30 border border-surface-700/10 p-3.5 space-y-3">
                                 <p className="text-xs font-medium text-surface-400">文本预处理规则</p>
-                                <CustomCheckbox
-                                    checked={preprocessRules.removeSpaces}
-                                    onChange={(v) => setPreprocessRules((p) => ({
-                                      ...p,
-                                      removeSpaces: v
-                                    }))}
-                                    label="替换掉连续的空格、换行符和制表符"
-                                />
-                                <CustomCheckbox
-                                    checked={preprocessRules.removeUrls}
-                                    onChange={(v) => setPreprocessRules((p) => ({
-                                      ...p,
-                                      removeUrls: v
-                                    }))}
-                                    label="删除所有 URL 和电子邮件地址"
-                                />
+                                <div className="space-y-2.5">
+                                  <CustomCheckbox
+                                      checked={preprocessRules.removeSpaces}
+                                      onChange={(v) => setPreprocessRules((p) => ({
+                                        ...p,
+                                        removeSpaces: v
+                                      }))}
+                                      label="替换掉连续的空格、换行符和制表符"
+                                  />
+                                  <CustomCheckbox
+                                      checked={preprocessRules.removeUrls}
+                                      onChange={(v) => setPreprocessRules((p) => ({
+                                        ...p,
+                                        removeUrls: v
+                                      }))}
+                                      label="删除所有 URL 和电子邮件地址"
+                                  />
+                                </div>
                               </div>
-
 
                               {/* 使用 Q&A 分段 */}
                               <div className="flex items-center gap-2">
@@ -472,17 +703,31 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                     checked={preprocessRules.useQa}
                                     onChange={(v) => setPreprocessRules((p) => ({...p, useQa: v}))}
                                 >
-                                  <span
-                                      className="text-sm text-surface-500">使用 Q&A 分段</span>
+                                  <span className="text-sm text-surface-500">使用 Q&A 分段</span>
                                 </CustomCheckbox>
                               </div>
 
                               {/* 底部按钮 */}
-                              <div className="flex items-center gap-2 pt-1">
+                              <div className="flex items-center justify-between pt-1">
                                 <button
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60 transition-colors">
-                                  <Search size={12}/>
-                                  预览块
+                                    onClick={handlePreviewChunks}
+                                    disabled={previewState === 'loading' || files.every(f => f.status !== 'done')}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${
+                                      previewState === 'loading'
+                                        ? 'text-surface-500 bg-surface-800/20 border border-surface-700/10 cursor-not-allowed'
+                                        : 'text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60'
+                                    }`}>
+                                  {previewState === 'loading' ? (
+                                    <>
+                                      <div className="w-3 h-3 border-2 border-surface-600 border-t-primary-500 rounded-full animate-spin"/>
+                                      加载中...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Search size={12}/>
+                                      预览块
+                                    </>
+                                  )}
                                 </button>
                                 <button
                                     onClick={() => {
@@ -495,6 +740,9 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                         autoSummary: false,
                                         useQa: false,
                                       });
+                                      setPreviewState('idle');
+                                      setPreviewChunkList([]);
+                                      setPreviewError('');
                                     }}
                                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60 transition-colors"
                                 >
@@ -537,126 +785,131 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                             <motion.div
                                 initial={{opacity: 0, height: 0}}
                                 animate={{opacity: 1, height: 'auto'}}
-                                className="px-4 pb-4 space-y-4"
+                                className="px-4 pb-4 space-y-5"
                             >
                               {/* 父块用作上下文 */}
                               <div>
-                                <p className="text-xs font-medium text-surface-300 mb-3">父块用作上下文</p>
-
-                                {/* 段落 Card */}
-                                <div
-                                    onClick={() => setParentChildConfig(p => ({...p, parentMode: 'paragraph'}))}
-                                    className={`rounded-xl border p-3 mb-3 cursor-pointer transition-all ${
-                                        parentChildConfig.parentMode === 'paragraph'
-                                            ? 'border-primary-500/30 bg-primary-500/[0.03]'
-                                            : 'border-surface-700/20 bg-surface-950/20'
-                                    }`}
-                                >
-                                  <div className="flex items-start gap-3">
-                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                                        parentChildConfig.parentMode === 'paragraph' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
-                                    }`}>
-                                      <FileText size={15}/>
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                      <div className="flex items-center justify-between gap-2">
-                                        <div className={`text-sm font-medium ${parentChildConfig.parentMode === 'paragraph' ? 'text-surface-100' : 'text-surface-300'}`}>
-                                          段落
-                                        </div>
-                                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
-                                            parentChildConfig.parentMode === 'paragraph'
-                                                ? 'border-primary-500'
-                                                : 'border-surface-600'
-                                        }`}>
-                                          {parentChildConfig.parentMode === 'paragraph' && (
-                                              <div className="w-2 h-2 rounded-full bg-primary-500"/>
-                                          )}
-                                        </div>
+                                <p className="text-xs font-medium text-surface-400 mb-3">父块用作上下文</p>
+                                <div className="grid grid-cols-2 gap-3">
+                                  {/* 段落 Card */}
+                                  <div
+                                      onClick={() => setParentChildConfig(p => ({...p, parentMode: 'paragraph'}))}
+                                      className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                                          parentChildConfig.parentMode === 'paragraph'
+                                              ? 'border-primary-500/30 bg-primary-500/[0.03]'
+                                              : 'border-surface-700/20 bg-surface-950/20 hover:border-surface-700/40'
+                                      }`}
+                                  >
+                                    <div className="flex items-start gap-2.5">
+                                      <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                                          parentChildConfig.parentMode === 'paragraph' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
+                                      }`}>
+                                        <FileText size={14}/>
                                       </div>
-                                      <p className="text-xs text-surface-500 mt-0.5">此模式根据分隔符和最大块长度将文本拆分为段落，使用拆分文本作为检索的父块</p>
-                                    </div>
-                                  </div>
-
-                                  {parentChildConfig.parentMode === 'paragraph' && (
-                                      <div className="grid grid-cols-2 gap-3 mt-3">
-                                        <div>
-                                          <label className="flex items-center gap-1 text-xs text-surface-500 mb-1.5">
-                                            分段标识符
-                                            <HelpCircle size={12} className="text-surface-600"/>
-                                          </label>
-                                          <input
-                                              type="text"
-                                              value={parentChildConfig.parentDelimiter}
-                                              onChange={(e) => setParentChildConfig(p => ({
-                                                ...p,
-                                                parentDelimiter: e.target.value
-                                              }))}
-                                              className="w-full px-3 py-2 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
-                                          />
-                                        </div>
-                                        <div>
-                                          <label className="block text-xs text-surface-500 mb-1.5">分段最大长度</label>
-                                          <div className="relative">
-                                            <input
-                                                type="number"
-                                                value={parentChildConfig.parentMaxLength}
-                                                onChange={(e) => setParentChildConfig(p => ({
-                                                  ...p,
-                                                  parentMaxLength: Number(e.target.value)
-                                                }))}
-                                                className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
-                                            />
-                                            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1.5 py-0.5 rounded">characters</span>
+                                      <div className="flex-1 min-w-0">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <div className={`text-sm font-medium ${parentChildConfig.parentMode === 'paragraph' ? 'text-surface-100' : 'text-surface-300'}`}>
+                                            段落
+                                          </div>
+                                          <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                                              parentChildConfig.parentMode === 'paragraph'
+                                                  ? 'border-primary-500'
+                                                  : 'border-surface-600'
+                                          }`}>
+                                            {parentChildConfig.parentMode === 'paragraph' && (
+                                                <div className="w-1.5 h-1.5 rounded-full bg-primary-500"/>
+                                            )}
                                           </div>
                                         </div>
+                                        <p className="text-[11px] text-surface-500 mt-1 leading-relaxed">按分隔符拆分为段落</p>
                                       </div>
-                                  )}
-                                </div>
-
-                                {/* 全文 Card */}
-                                <div
-                                    onClick={() => setParentChildConfig(p => ({...p, parentMode: 'full'}))}
-                                    className={`rounded-xl border p-3 cursor-pointer transition-all ${
-                                        parentChildConfig.parentMode === 'full'
-                                            ? 'border-primary-500/30 bg-primary-500/[0.03]'
-                                            : 'border-surface-700/20 bg-surface-950/20'
-                                    }`}
-                                >
-                                  <div className="flex items-start gap-3">
-                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                                        parentChildConfig.parentMode === 'full' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
-                                    }`}>
-                                      <BookOpen size={15}/>
                                     </div>
-                                    <div className="flex-1 min-w-0">
-                                      <div className="flex items-center justify-between gap-2">
-                                        <div className={`text-sm font-medium ${parentChildConfig.parentMode === 'full' ? 'text-surface-100' : 'text-surface-300'}`}>
-                                          全文
-                                        </div>
-                                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
-                                            parentChildConfig.parentMode === 'full'
-                                                ? 'border-primary-500'
-                                                : 'border-surface-600'
-                                        }`}>
-                                          {parentChildConfig.parentMode === 'full' && (
-                                              <div className="w-2 h-2 rounded-full bg-primary-500"/>
-                                          )}
-                                        </div>
+
+                                    {parentChildConfig.parentMode === 'paragraph' && (
+                                        <motion.div
+                                          initial={{opacity: 0, height: 0}}
+                                          animate={{opacity: 1, height: 'auto'}}
+                                          className="grid grid-cols-1 gap-2 mt-3"
+                                        >
+                                          <div>
+                                            <label className="flex items-center gap-1 text-[11px] text-surface-500 mb-1.5">
+                                              分段标识符
+                                              <HelpCircle size={10} className="text-surface-600"/>
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={parentChildConfig.parentDelimiter}
+                                                onChange={(e) => setParentChildConfig(p => ({
+                                                  ...p,
+                                                  parentDelimiter: e.target.value
+                                                }))}
+                                                className="w-full px-2.5 py-1.5 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[11px] text-surface-500 mb-1.5">分段最大长度</label>
+                                            <div className="relative">
+                                              <input
+                                                  type="number"
+                                                  value={parentChildConfig.parentMaxLength}
+                                                  onChange={(e) => setParentChildConfig(p => ({
+                                                    ...p,
+                                                    parentMaxLength: Number(e.target.value)
+                                                  }))}
+                                                  className="w-full px-2.5 py-1.5 pr-16 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
+                                              />
+                                              <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1 py-0.5 rounded">chars</span>
+                                            </div>
+                                          </div>
+                                        </motion.div>
+                                    )}
+                                  </div>
+
+                                  {/* 全文 Card */}
+                                  <div
+                                      onClick={() => setParentChildConfig(p => ({...p, parentMode: 'full'}))}
+                                      className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                                          parentChildConfig.parentMode === 'full'
+                                              ? 'border-primary-500/30 bg-primary-500/[0.03]'
+                                              : 'border-surface-700/20 bg-surface-950/20 hover:border-surface-700/40'
+                                      }`}
+                                  >
+                                    <div className="flex items-start gap-2.5">
+                                      <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                                          parentChildConfig.parentMode === 'full' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
+                                      }`}>
+                                        <BookOpen size={14}/>
                                       </div>
-                                      <p className="text-xs text-surface-500 mt-0.5">整个文档用作父块并直接检索。请注意，出于性能原因，超过 10000 个标记的文本将被自动截断。</p>
+                                      <div className="flex-1 min-w-0">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <div className={`text-sm font-medium ${parentChildConfig.parentMode === 'full' ? 'text-surface-100' : 'text-surface-300'}`}>
+                                            全文
+                                          </div>
+                                          <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                                              parentChildConfig.parentMode === 'full'
+                                                  ? 'border-primary-500'
+                                                  : 'border-surface-600'
+                                          }`}>
+                                            {parentChildConfig.parentMode === 'full' && (
+                                                <div className="w-1.5 h-1.5 rounded-full bg-primary-500"/>
+                                            )}
+                                          </div>
+                                        </div>
+                                        <p className="text-[11px] text-surface-500 mt-1 leading-relaxed">整个文档作为父块，超过 10000 标记自动截断</p>
+                                      </div>
                                     </div>
                                   </div>
                                 </div>
                               </div>
 
                               {/* 子块用于检索 */}
-                              <div>
-                                <p className="text-xs font-medium text-surface-300 mb-3">子块用于检索</p>
+                              <div className="rounded-lg bg-surface-950/30 border border-surface-700/10 p-3.5 space-y-3">
+                                <p className="text-xs font-medium text-surface-400">子块用于检索</p>
                                 <div className="grid grid-cols-2 gap-3">
                                   <div>
-                                    <label className="flex items-center gap-1 text-xs text-surface-500 mb-1.5">
+                                    <label className="flex items-center gap-1 text-[11px] text-surface-500 mb-1.5">
                                       分段标识符
-                                      <HelpCircle size={12} className="text-surface-600"/>
+                                      <HelpCircle size={10} className="text-surface-600"/>
                                     </label>
                                     <input
                                         type="text"
@@ -665,11 +918,11 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                           ...p,
                                           childDelimiter: e.target.value
                                         }))}
-                                        className="w-full px-3 py-2 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
+                                        className="w-full px-2.5 py-1.5 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
                                     />
                                   </div>
                                   <div>
-                                    <label className="block text-xs text-surface-500 mb-1.5">分段最大长度</label>
+                                    <label className="block text-[11px] text-surface-500 mb-1.5">分段最大长度</label>
                                     <div className="relative">
                                       <input
                                           type="number"
@@ -678,32 +931,37 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                             ...p,
                                             childMaxLength: Number(e.target.value)
                                           }))}
-                                          className="w-full px-3 py-2 pr-20 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/40 transition-colors"
+                                          className="w-full px-2.5 py-1.5 pr-16 rounded-lg bg-surface-950/50 border border-surface-700/30 text-sm text-surface-200 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
                                       />
-                                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1.5 py-0.5 rounded">characters</span>
+                                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-surface-500 bg-surface-800/80 px-1 py-0.5 rounded">chars</span>
                                     </div>
                                   </div>
                                 </div>
                               </div>
 
                               {/* 文本预处理规则 */}
-                              <div className="space-y-2.5 pt-1">
+                              <div className="rounded-lg bg-surface-950/30 border border-surface-700/10 p-3.5 space-y-3">
                                 <p className="text-xs font-medium text-surface-400">文本预处理规则</p>
-                                <CustomCheckbox
-                                    checked={parentChildConfig.removeSpaces}
-                                    onChange={(v) => setParentChildConfig(p => ({...p, removeSpaces: v}))}
-                                    label="替换掉连续的空格、换行符和制表符"
-                                />
-                                <CustomCheckbox
-                                    checked={parentChildConfig.removeUrls}
-                                    onChange={(v) => setParentChildConfig(p => ({...p, removeUrls: v}))}
-                                    label="删除所有 URL 和电子邮件地址"
-                                />
+                                <div className="space-y-2.5">
+                                  <CustomCheckbox
+                                      checked={parentChildConfig.removeSpaces}
+                                      onChange={(v) => setParentChildConfig(p => ({...p, removeSpaces: v}))}
+                                      label="替换掉连续的空格、换行符和制表符"
+                                  />
+                                  <CustomCheckbox
+                                      checked={parentChildConfig.removeUrls}
+                                      onChange={(v) => setParentChildConfig(p => ({...p, removeUrls: v}))}
+                                      label="删除所有 URL 和电子邮件地址"
+                                  />
+                                </div>
                               </div>
 
                               {/* 摘要自动生成 */}
-                              <div className="flex items-center justify-between pt-1">
-                                <span className="text-sm text-surface-300">摘要自动生成</span>
+                              <div className="flex items-center justify-between rounded-lg bg-surface-950/30 border border-surface-700/10 p-3.5">
+                                <div>
+                                  <p className="text-sm text-surface-300">摘要自动生成</p>
+                                  <p className="text-[11px] text-surface-500 mt-0.5">为每个父块自动生成摘要</p>
+                                </div>
                                 <button
                                     type="button"
                                     onClick={() => setParentChildConfig(p => ({...p, autoSummary: !p.autoSummary}))}
@@ -711,18 +969,33 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                         parentChildConfig.autoSummary ? 'bg-primary-600' : 'bg-surface-700'
                                     }`}
                                 >
-                            <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                                parentChildConfig.autoSummary ? 'translate-x-4' : 'translate-x-0'
-                            }`}/>
+                                  <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                                      parentChildConfig.autoSummary ? 'translate-x-4' : 'translate-x-0'
+                                  }`}/>
                                 </button>
                               </div>
 
                               {/* 底部按钮 */}
-                              <div className="flex items-center gap-2 pt-1">
+                              <div className="flex items-center justify-between pt-1">
                                 <button
-                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60 transition-colors">
-                                  <Search size={12}/>
-                                  预估块
+                                    onClick={handlePreviewChunks}
+                                    disabled={previewState === 'loading' || files.every(f => f.status !== 'done')}
+                                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors ${
+                                      previewState === 'loading'
+                                        ? 'text-surface-500 bg-surface-800/20 border border-surface-700/10 cursor-not-allowed'
+                                        : 'text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60'
+                                    }`}>
+                                  {previewState === 'loading' ? (
+                                    <>
+                                      <div className="w-3 h-3 border-2 border-surface-600 border-t-primary-500 rounded-full animate-spin"/>
+                                      加载中...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Search size={12}/>
+                                      预览块
+                                    </>
+                                  )}
                                 </button>
                                 <button
                                     onClick={() => {
@@ -736,6 +1009,9 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                                         removeUrls: true,
                                         autoSummary: false,
                                       });
+                                      setPreviewState('idle');
+                                      setPreviewChunkList([]);
+                                      setPreviewError('');
                                     }}
                                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60 transition-colors"
                                 >
@@ -746,9 +1022,251 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                             </motion.div>
                         )}
                       </div>
+
+                      {/* 分隔线 */}
+                      <div className="border-t border-surface-700/10 pt-3">
+                        {/* 文档设置 */}
+                        <div className="flex items-center gap-2 mb-1">
+                          <div className="w-1 h-4 rounded-full bg-primary-500/60"/>
+                          <h2 className="text-sm font-semibold text-surface-200 tracking-wide">文档设置</h2>
+                        </div>
+                      </div>
+
+                      {/* 元数据设置 Card */}
+                      <div className="rounded-xl border border-surface-700/20 bg-surface-900/30 overflow-hidden">
+                        <button
+                          onClick={openMetadataModal}
+                          className="w-full flex items-center gap-3 p-4 text-left group"
+                        >
+                          <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 bg-surface-800 text-surface-500 group-hover:bg-primary-600/15 group-hover:text-primary-400 transition-all">
+                            <SlidersHorizontal size={16}/>
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-medium text-surface-200">元数据设置</div>
+                            <p className="text-xs text-surface-500 mt-0.5">
+                              {selectedMetadata.length > 0
+                                ? `已配置 ${selectedMetadata.length} 个元数据字段`
+                                : '为文档添加元数据字段'}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-surface-800/60 text-xs text-surface-400 group-hover:bg-primary-600/15 group-hover:text-primary-300 transition-all border border-surface-700/20 group-hover:border-primary-500/20">
+                            <Plus size={12}/>
+                            <span>添加</span>
+                          </div>
+                        </button>
+
+                        {selectedMetadata.length > 0 ? (
+                          <motion.div
+                            initial={{opacity: 0, height: 0}}
+                            animate={{opacity: 1, height: 'auto'}}
+                            className="px-4 pb-4"
+                          >
+                            {/* 表头 */}
+                            <div className="flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-surface-500 font-medium border-b border-surface-700/10">
+                              <span className="w-36">字段名</span>
+                              <span className="flex-1">值</span>
+                              <span className="w-6 text-right">操作</span>
+                            </div>
+                            <div className="max-h-44 overflow-y-auto" style={{scrollbarWidth: 'thin'}}>
+                              {selectedMetadata.map((meta) => (
+                                <div
+                                  key={meta.id}
+                                  className="flex items-center gap-2 px-2.5 py-2 border-b border-surface-700/5 last:border-0 hover:bg-surface-800/20 transition-colors"
+                                >
+                                  <div className="flex items-center gap-1.5 w-36 flex-shrink-0">
+                                    <div className="flex items-center justify-center w-5 h-5 rounded bg-surface-800/60 border border-surface-700/20 flex-shrink-0">
+                                      {meta.field_type === 'number' ? (
+                                        <Hash size={9} className="text-surface-400"/>
+                                      ) : meta.field_type === 'time' ? (
+                                        <Clock size={9} className="text-surface-400"/>
+                                      ) : (
+                                        <Type size={9} className="text-surface-400"/>
+                                      )}
+                                    </div>
+                                    <span className="text-xs text-surface-300 truncate">{meta.name}</span>
+                                  </div>
+                                  <input
+                                    type="text"
+                                    value={meta.value}
+                                    onChange={(e) => updateMetadataValue(meta.id, e.target.value)}
+                                    placeholder="输入值"
+                                    className="flex-1 min-w-0 px-2 py-1 rounded bg-surface-950/50 border border-surface-700/20 text-xs text-surface-200 placeholder:text-surface-600 outline-none focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/20 transition-all"
+                                  />
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      removeSelectedMetadata(meta.id);
+                                    }}
+                                    className="w-6 h-6 flex items-center justify-center rounded-md text-surface-600 hover:text-red-400 hover:bg-red-500/10 transition-colors flex-shrink-0"
+                                  >
+                                    <X size={11}/>
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </motion.div>
+                        ) : (
+                          <div className="px-4 pb-4">
+                            <div className="rounded-lg bg-surface-950/30 border border-surface-700/10 p-3 flex items-center gap-2 text-xs text-surface-500">
+                              <SlidersHorizontal size={12} className="text-surface-600"/>
+                              <span>未配置元数据，点击上方添加按钮选择字段</span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* 权限设置 Card */}
+                      <div className="rounded-xl border border-surface-700/20 bg-surface-900/30 overflow-hidden p-4">
+                        <div className="flex items-center gap-3 mb-4">
+                          <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 bg-surface-800 text-surface-500">
+                            <Users size={16}/>
+                          </div>
+                          <div>
+                            <div className="text-sm font-medium text-surface-200">权限设置</div>
+                            <p className="text-xs text-surface-500 mt-0.5">选择谁可以查看此文档</p>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <button
+                            onClick={() => setDocPermission('public')}
+                            className={`relative rounded-xl border p-3 text-left transition-all ${
+                              docPermission === 'public'
+                                ? 'border-primary-500/30 bg-primary-500/[0.04]'
+                                : 'border-surface-700/20 bg-surface-950/20 hover:border-surface-700/40'
+                            }`}
+                          >
+                            <div className="flex items-start gap-2.5">
+                              <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                                docPermission === 'public' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
+                              }`}>
+                                <Users size={14}/>
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className={`text-sm font-medium ${docPermission === 'public' ? 'text-surface-100' : 'text-surface-300'}`}>
+                                    全部可见
+                                  </span>
+                                  <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                                    docPermission === 'public' ? 'border-primary-500' : 'border-surface-600'
+                                  }`}>
+                                    {docPermission === 'public' && <div className="w-1.5 h-1.5 rounded-full bg-primary-500"/>}
+                                  </div>
+                                </div>
+                                <p className="text-[11px] text-surface-500 mt-1 leading-relaxed">所有人都可以查看和检索此文档</p>
+                              </div>
+                            </div>
+                          </button>
+
+                          <button
+                            onClick={() => setDocPermission('private')}
+                            className={`relative rounded-xl border p-3 text-left transition-all ${
+                              docPermission === 'private'
+                                ? 'border-primary-500/30 bg-primary-500/[0.04]'
+                                : 'border-surface-700/20 bg-surface-950/20 hover:border-surface-700/40'
+                            }`}
+                          >
+                            <div className="flex items-start gap-2.5">
+                              <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                                docPermission === 'private' ? 'bg-primary-600/15 text-primary-400' : 'bg-surface-800 text-surface-500'
+                              }`}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className={`text-sm font-medium ${docPermission === 'private' ? 'text-surface-100' : 'text-surface-300'}`}>
+                                    仅自己可见
+                                  </span>
+                                  <div className={`w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                                    docPermission === 'private' ? 'border-primary-500' : 'border-surface-600'
+                                  }`}>
+                                    {docPermission === 'private' && <div className="w-1.5 h-1.5 rounded-full bg-primary-500"/>}
+                                  </div>
+                                </div>
+                                <p className="text-[11px] text-surface-500 mt-1 leading-relaxed">仅文档创建者可以查看和检索</p>
+                              </div>
+                            </div>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* 所属领域 Card */}
+                      <div className="rounded-xl border border-surface-700/20 bg-surface-900/30 overflow-hidden p-4">
+                        <div className="flex items-center gap-3 mb-4">
+                          <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 bg-surface-800 text-surface-500">
+                            <Tag size={16}/>
+                          </div>
+                          <div>
+                            <div className="text-sm font-medium text-surface-200">所属领域</div>
+                            <p className="text-xs text-surface-500 mt-0.5">选择文档所属的业务领域</p>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2.5">
+                          {FIELD_OPTIONS.map((field) => {
+                            const isSelected = selectedFields.includes(field);
+                            return (
+                              <button
+                                key={field}
+                                onClick={() => toggleField(field)}
+                                className={`relative flex items-center gap-2.5 px-3 py-2.5 rounded-lg border text-left transition-all ${
+                                  isSelected
+                                    ? 'border-primary-500/30 bg-primary-500/[0.04]'
+                                    : 'border-surface-700/20 bg-surface-950/20 hover:border-surface-700/40'
+                                }`}
+                              >
+                                <div className={`w-4 h-4 rounded flex items-center justify-center transition-all border ${
+                                  isSelected
+                                    ? 'bg-primary-600 border-primary-500 shadow-sm shadow-primary-500/20'
+                                    : 'bg-surface-950/50 border-surface-700/40'
+                                }`}>
+                                  {isSelected && <Check size={9} className="text-white" strokeWidth={3}/>}
+                                </div>
+                                <span className={`text-sm ${isSelected ? 'text-surface-100 font-medium' : 'text-surface-300'}`}>
+                                  {field}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {selectedFields.length > 0 && (
+                          <motion.div
+                            initial={{opacity: 0, y: -4}}
+                            animate={{opacity: 1, y: 0}}
+                            className="mt-3 pt-3 border-t border-surface-700/10"
+                          >
+                            <p className="text-[11px] text-surface-500 mb-2">已选领域</p>
+                            <div className="flex flex-wrap gap-2">
+                              {selectedFields.map((field) => (
+                                <span
+                                  key={field}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primary-600/10 border border-primary-500/20 text-xs text-primary-300"
+                                >
+                                  {field}
+                                  <button
+                                    onClick={() => removeField(field)}
+                                    className="w-4 h-4 flex items-center justify-center rounded-full hover:bg-primary-500/20 transition-colors"
+                                  >
+                                    <X size={10}/>
+                                  </button>
+                                </span>
+                              ))}
+                            </div>
+                          </motion.div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Bottom Actions */}
+                    {saveError && (
+                      <div className="px-6 py-2 bg-red-500/5 border-t border-red-500/10">
+                        <p className="text-xs text-red-400 flex items-center gap-1.5">
+                          <X size={12}/>
+                          {saveError}
+                        </p>
+                      </div>
+                    )}
                     <div
                         className="px-6 py-4 border-t border-surface-700/20 flex items-center justify-between bg-surface-950/30">
                       <button
@@ -759,54 +1277,167 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                         上一步
                       </button>
                       <button
-                          onClick={() => {
-                            setFiles((prev) => prev.map((f) => ({...f, status: 'done'})));
-                            setStep(3);
-                          }}
-                          className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white bg-primary-600 hover:bg-primary-500 border border-primary-500/30 shadow-lg shadow-primary-600/20 transition-colors"
+                          onClick={handleSaveAndProcess}
+                          disabled={saving}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-white border border-primary-500/30 shadow-lg shadow-primary-600/20 transition-colors ${
+                            saving
+                              ? 'bg-primary-600/70 cursor-not-allowed'
+                              : 'bg-primary-600 hover:bg-primary-500'
+                          }`}
                       >
-                        保存并处理
+                        {saving ? (
+                          <>
+                            <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"/>
+                            处理中...
+                          </>
+                        ) : (
+                          <>
+                            保存并处理
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
 
                   {/* Right Panel - Preview Chunk列表 */}
-                  <div className="w-[480px] flex-shrink-0 flex flex-col min-w-0 bg-surface-900/10">
-                    <div
-                        className="flex items-center justify-between px-4 py-3 border-b border-surface-700/20">
-                      <div className="flex items-center gap-1.5 text-xs text-surface-300">
-                        <span className="text-[10px] text-primary-400 font-medium mr-1">预览</span>
-                        <FileText size={12} className="text-primary-400"/>
-                        <span
-                            className="truncate max-w-[200px]">{files[0]?.name || 'CLAUDE模版.md'}</span>
-                        <ChevronDown size={12} className="text-surface-500"/>
+                  <div className="flex-[2] flex flex-col min-w-0 bg-surface-900/10">
+                    <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700/20">
+                      <div className="flex items-center gap-2 text-xs text-surface-300">
+                        <span className="text-[10px] text-primary-400 font-medium">预览</span>
+                        <div className="w-px h-3 bg-surface-700/30"/>
+                        {/* 文件选择器 */}
+                        {getUploadedFiles().length > 1 ? (
+                          <select
+                            value={selectedPreviewFileId || getUploadedFiles()[0]?.id || ''}
+                            onChange={(e) => setSelectedPreviewFileId(e.target.value)}
+                            className="bg-surface-900/50 border border-surface-700/20 rounded px-2 py-0.5 text-[11px] text-surface-300 outline-none focus:border-primary-500/30"
+                          >
+                            {files.filter(f => f.status === 'done' && f.uploadedInfo).map(f => (
+                              <option key={f.id} value={f.id}>
+                                {f.name}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <>
+                            <FileText size={11} className="text-surface-500"/>
+                            <span className="truncate max-w-[160px]">{getSelectedPreviewFile()?.name || '请选择文件'}</span>
+                          </>
+                        )}
                       </div>
-                      <span
-                          className="text-[10px] text-surface-600 border border-surface-700/30 px-1.5 py-0.5 rounded">
-                        {segmentMode === 'parent_child' ? '0 预估块' : '13 预估块'}
+                      <span className="text-[10px] text-surface-500 bg-surface-800/40 border border-surface-700/20 px-1.5 py-0.5 rounded">
+                        {previewState === 'success'
+                          ? (segmentMode === 'parent_child'
+                            ? `${previewParentChildList.length} 个父块, ${previewParentChildList.reduce((sum, p) => sum + p.children.length, 0)} 个子块`
+                            : `${previewChunkList.length} 个块`)
+                          : '0 个块'}
                       </span>
                     </div>
-                    <div className="flex-1 overflow-y-auto px-5 py-4">
-                      {segmentMode === 'parent_child' ? (
-                          <div className="h-full flex flex-col items-center justify-center text-surface-600">
-                            <Search size={36} className="mb-3 opacity-20"/>
-                            <p className="text-xs text-center">点击左侧的"预览块"按钮来加载预览</p>
-                          </div>
-                      ) : (
-                          <div className="space-y-5">
-                            {MOCK_CHUNKS.map((chunk) => (
-                                <div key={chunk.id}>
-                                  <div
-                                      className="flex items-center gap-1.5 text-xs text-surface-500 mb-1.5">
-                                    <LayoutTemplate size={11} className="text-surface-600"/>
-                                    <span>Chunk-{chunk.id} · {chunk.length} characters</span>
-                                  </div>
-                                  <p className="text-sm text-surface-300 leading-relaxed">
-                                    {chunk.content}
-                                  </p>
+                    <div className="flex-1 overflow-y-auto px-4 py-4" style={{scrollbarWidth: 'thin'}}>
+                      {previewState === 'idle' && (
+                        <div className="h-full flex flex-col items-center justify-center text-surface-600">
+                          <Search size={32} className="mb-3 opacity-20"/>
+                          <p className="text-xs text-center">点击左侧的"预览块"按钮来加载预览</p>
+                        </div>
+                      )}
+
+                      {previewState === 'loading' && (
+                        <div className="h-full flex flex-col items-center justify-center text-surface-600">
+                          <div className="w-6 h-6 border-2 border-surface-600 border-t-primary-500 rounded-full animate-spin mb-3"/>
+                          <p className="text-xs text-center">正在预览分块...</p>
+                        </div>
+                      )}
+
+                      {previewState === 'error' && (
+                        <div className="h-full flex flex-col items-center justify-center text-surface-600">
+                          <X size={32} className="mb-3 opacity-20 text-red-400"/>
+                          <p className="text-xs text-center text-red-300">{previewError}</p>
+                          <button
+                            onClick={handlePreviewChunks}
+                            className="mt-3 px-3 py-1.5 rounded-lg text-xs text-surface-400 hover:text-surface-300 bg-surface-800/40 border border-surface-700/20 hover:bg-surface-800/60 transition-colors"
+                          >
+                            重试
+                          </button>
+                        </div>
+                      )}
+
+                      {previewState === 'success' && previewChunkList.length === 0 && previewParentChildList.length === 0 && (
+                        <div className="h-full flex flex-col items-center justify-center text-surface-600">
+                          <FileText size={32} className="mb-3 opacity-20"/>
+                          <p className="text-xs text-center">未生成分块，请检查分段参数</p>
+                        </div>
+                      )}
+
+                      {/* 父子分段模式：父块包含子块的层级展示 */}
+                      {previewState === 'success' && previewParentChildList.length > 0 && (
+                        <div className="space-y-6">
+                          {previewParentChildList.map((parent) => (
+                            <div
+                              key={parent.parentId}
+                              className="rounded-xl border border-primary-500/20 bg-surface-900/30 overflow-hidden"
+                            >
+                              {/* 父块头部 */}
+                              <div className="px-4 py-3 bg-primary-600/5 border-b border-primary-500/10">
+                                <div className="flex items-center gap-2 text-[11px] text-primary-400 mb-1.5">
+                                  <BookOpen size={10} className="text-primary-400"/>
+                                  <span className="font-medium">父块-{parent.parentId}</span>
+                                  <span className="text-primary-400/50">·</span>
+                                  <span>{parent.parentLength} chars</span>
+                                  <span className="text-primary-400/50">·</span>
+                                  <span>{parent.children.length} 个子块</span>
                                 </div>
-                            ))}
-                          </div>
+                                <p className="text-sm text-surface-200 leading-relaxed line-clamp-3">
+                                  {parent.parentContent}
+                                </p>
+                              </div>
+
+                              {/* 子块列表 */}
+                              {parent.children.length > 0 && (
+                                <div className="p-3 space-y-2">
+                                  {parent.children.map((child, childIdx) => (
+                                    <div
+                                      key={child.id}
+                                      className="rounded-lg border border-surface-700/10 bg-surface-950/30 p-2.5 ml-3 relative"
+                                    >
+                                      {/* 连接线 */}
+                                      <div className="absolute -left-3 top-3 w-3 h-px bg-surface-700/30"/>
+                                      <div className="flex items-center gap-2 text-[10px] text-surface-500 mb-1">
+                                        <LayoutTemplate size={9} className="text-primary-500/50"/>
+                                        <span className="text-surface-400">子块-{childIdx + 1}</span>
+                                        <span className="text-surface-600">·</span>
+                                        <span>{child.length} chars</span>
+                                      </div>
+                                      <p className="text-xs text-surface-400 leading-relaxed">
+                                        {child.content}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {previewState === 'success' && previewChunkList.length > 0 && (
+                        <div className="space-y-4">
+                          {previewChunkList.map((chunk) => (
+                            <div
+                              key={chunk.id}
+                              className="rounded-lg border border-surface-700/10 bg-surface-900/20 p-3"
+                            >
+                              <div className="flex items-center gap-2 text-[11px] text-surface-500 mb-2">
+                                <LayoutTemplate size={10} className="text-primary-500/60"/>
+                                <span className="font-medium text-surface-400">Chunk-{chunk.id}</span>
+                                <span className="text-surface-600">·</span>
+                                <span>{chunk.length} chars</span>
+                              </div>
+                              <p className="text-sm text-surface-300 leading-relaxed">
+                                {chunk.content}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
                       )}
                     </div>
                   </div>
@@ -932,6 +1563,131 @@ export default function KnowledgeBaseCreatePage({onBack, onFinish}: {
                     </div>
                   </div>
                 </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* 元数据多选弹窗 */}
+          <AnimatePresence>
+            {showMetadataModal && (
+              <motion.div
+                initial={{opacity: 0}}
+                animate={{opacity: 1}}
+                exit={{opacity: 0}}
+                transition={{duration: 0.2}}
+                className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+                onClick={closeMetadataModal}
+              >
+                <motion.div
+                  initial={{opacity: 0, scale: 0.95, y: 10}}
+                  animate={{opacity: 1, scale: 1, y: 0}}
+                  exit={{opacity: 0, scale: 0.95, y: 10}}
+                  transition={{duration: 0.2}}
+                  className="w-[440px] max-w-[92vw] max-h-[85vh] flex flex-col rounded-xl border border-surface-700/30 bg-surface-900/95 backdrop-blur-xl shadow-2xl shadow-black/40"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {/* Header */}
+                  <div className="px-5 pt-5 pb-3 border-b border-surface-700/20">
+                    <div className="flex items-center justify-between mb-1">
+                      <h3 className="text-sm font-semibold text-surface-200">选择元数据</h3>
+                      <button
+                        onClick={closeMetadataModal}
+                        className="p-1.5 rounded-lg text-surface-500 hover:text-surface-300 hover:bg-surface-800/50 transition-colors"
+                      >
+                        <X size={16}/>
+                      </button>
+                    </div>
+                    <p className="text-xs text-surface-500">选择需要为此文档配置的元数据字段</p>
+                  </div>
+
+                  {/* List */}
+                  <div className="flex-1 overflow-y-auto px-2 py-2 min-h-0" style={{scrollbarWidth: 'thin'}}>
+                    {metaLoading ? (
+                      <div className="flex flex-col items-center justify-center py-10 text-surface-500">
+                        <div className="w-6 h-6 border-2 border-surface-600 border-t-primary-500 rounded-full animate-spin mb-3"/>
+                        <p className="text-sm">加载元数据中...</p>
+                      </div>
+                    ) : metadataList.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center py-10 text-surface-600">
+                        <div className="w-10 h-10 rounded-xl bg-surface-800/60 border border-surface-700/20 flex items-center justify-center mb-3">
+                          <SlidersHorizontal size={18} className="text-surface-500"/>
+                        </div>
+                        <p className="text-sm text-surface-400 font-medium">暂无元数据</p>
+                        <p className="text-xs text-surface-600 mt-1">请先前往知识库页面创建元数据字段</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-0.5">
+                        {metadataList.map((meta) => {
+                          const isSelected = tempSelectedIds.has(meta.id);
+                          return (
+                            <button
+                              key={meta.id}
+                              onClick={() => toggleTempMetadata(meta.id)}
+                              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-left ${
+                                isSelected
+                                  ? 'bg-primary-500/[0.06]'
+                                  : 'hover:bg-surface-800/30'
+                              }`}
+                            >
+                              <div className={`w-[18px] h-[18px] rounded-[5px] flex items-center justify-center transition-all border ${
+                                isSelected
+                                  ? 'bg-primary-600 border-primary-500 shadow-sm shadow-primary-500/20'
+                                  : 'bg-surface-950/50 border-surface-700/40'
+                              }`}>
+                                {isSelected && <Check size={10} className="text-white" strokeWidth={3}/>}
+                              </div>
+                              <div className={`flex items-center justify-center w-7 h-7 rounded-lg flex-shrink-0 border ${
+                                isSelected
+                                  ? 'bg-primary-600/10 border-primary-500/20 text-primary-400'
+                                  : 'bg-surface-800/60 border-surface-700/20 text-surface-400'
+                              }`}>
+                                {meta.field_type === 'number' ? (
+                                  <Hash size={13}/>
+                                ) : meta.field_type === 'time' ? (
+                                  <Clock size={13}/>
+                                ) : (
+                                  <Type size={13}/>
+                                )}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className={`text-sm truncate ${isSelected ? 'text-surface-100 font-medium' : 'text-surface-200'}`}>
+                                    {meta.name}
+                                  </span>
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-800/60 text-surface-500 border border-surface-700/20">
+                                    {meta.field_type}
+                                  </span>
+                                </div>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Footer */}
+                  <div className="px-5 py-4 border-t border-surface-700/20 flex items-center justify-between">
+                    <span className="text-xs text-surface-500">
+                      已选择 <span className="text-surface-300 font-medium">{tempSelectedIds.size}</span> 个字段
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={closeMetadataModal}
+                        className="px-4 py-2 rounded-lg bg-surface-800 border border-surface-700/30 text-sm text-surface-300 hover:bg-surface-700/60 transition-colors"
+                      >
+                        取消
+                      </button>
+                      <button
+                        onClick={confirmMetadataSelection}
+                        disabled={tempSelectedIds.size === 0}
+                        className="px-4 py-2 rounded-lg bg-primary-600 border border-primary-500/30 text-sm text-white hover:bg-primary-500 transition-colors shadow-lg shadow-primary-600/20 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        确定
+                      </button>
+                    </div>
+                  </div>
+                </motion.div>
+              </motion.div>
             )}
           </AnimatePresence>
         </div>
